@@ -1,7 +1,5 @@
-module intellibranch-demo
+module neurogate-demo
 
 go 1.21
 
-require intellibranch v0.0.0
-
-replace intellibranch => "../IntelliBranch - lib"
+require github.com/gluedays-cyber/neurogate v1.0.0
