@@ -65,7 +65,7 @@ func printLogo() {
 	fmt.Println("  | \\| |___ |__| |  \\ |__| |__] |  |  |  |___ ")
 	fmt.Println("                   D E M O   S U I T E")
 	fmt.Println()
-	fmt.Println("  Demo for NeuroGate: On-The-Fly Training & Practical Branching in Pure Go")
+	fmt.Println("  NeuroGate Demos: On-The-Fly Training & Practical Branching in Pure Go")
 	fmt.Println("  Creates domain AI from scratch in ~1.5s | Routes flow in ~30 μs (0 B/op)")
 	fmt.Println("  Zero Downloads | Zero Cloud Dependency | Zero CGO | Single Static Binary")
 	fmt.Println("================================================================================")
