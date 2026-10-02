@@ -30,6 +30,9 @@ This guide provides pure Go engineers with a deep-dive technical manual and hand
    - [Context Propagation & Timeouts](#51-context-propagation--timeouts)
    - [Atomic Zero-Downtime Weight Hot-Reloading](#52-atomic-zero-downtime-weight-hot-reloading)
    - [Whitebox Telemetry & Active Learning Feedback Loop](#53-whitebox-telemetry--active-learning-feedback-loop)
+     - [5.3.1. Resolution of Rejected Queries via Retraining](#531-resolution-of-rejected-queries-via-retraining)
+     - [5.3.2. Lexical Variant Augmentation & Typo Clusters](#532-lexical-variant-augmentation--typo-clusters)
+     - [5.3.3. Training & Retraining Best Practices](#533-training--retraining-best-practices)
    - [Semantic LLM Gateway & Cloud Bypass](#54-semantic-llm-gateway--cloud-bypass)
    - [Hierarchical Cascading Multi-Router](#55-hierarchical-cascading-multi-router)
    - [Context-Enriched Metadata Synthesis](#56-context-enriched-metadata-synthesis)
@@ -681,6 +684,136 @@ slog.Info("NeuroGate dispatch complete",
 	"unknown_tokens", trace.UnknownTokenRatio,
 	"duration_micros", trace.LatencyMicros,
 )
+```
+
+#### 5.3.1. Resolution of Rejected Queries via Retraining
+
+In production, user queries may fail routing criteria due to:
+- **Layer 1 Rejection**: Unlearned vocabulary or unfamiliar character sequences (`SingleCharRatio >= MaxSingleCharRatio`, returning `ErrUnlearnedVocabulary`).
+- **Layer 2 Rejection**: Free energy below domain threshold (`Energy < MinLogSumExp`, returning `ErrOutOfDomain`), high entropy (`Entropy > MaxEntropy`), or low confidence.
+- **Ambiguous Margins**: Competing top-2 candidates with narrow separation (`Margin < MarginCutoff`, returning `ErrAmbiguousIntent`).
+
+NeuroGate **strictly rejects forced classification**, preventing catastrophic misrouting (such as granting an unauthorized refund or wiping a server on unrecognized noise). Instead, these rejected requests are captured in the Active Learning Buffer (`DrainTelemetry()`).
+
+```
+[ Rejected / Quarantined Query ]
+              │
+              ▼
+[ Human Review: Assign Ground Truth Intent ]
+              │
+              ▼
+[ Append to CSV Dataset with Phrasing Variants ]
+              │
+              ▼
+[ Re-Train Neural Model in ~1.5s ]
+              │
+              ▼
+[ Atomic Hot-Reload via router.Reload() ]
+              │
+              ▼
+[ Future Queries Processed Confidently in ~30 μs! ]
+```
+
+Once a developer or operator verifies the true intent and appends the query to `dataset.csv`, **re-compiling and hot-reloading the model enables future occurrences of that query to route immediately and deterministically with ~30 μs zero-allocation performance.**
+
+---
+
+#### 5.3.2. Lexical Variant Augmentation & Typo Clusters
+
+When updating the dataset with an unlearned statement, **never add only a single isolated query**. Adding a single sentence can result in weak token coverage and fragile vector boundaries. Instead, add **3 to 5 lexical variants, syntax inversions, and common typo patterns** together with the target statement:
+
+```csv
+text,label
+"cancel this transaction and reverse payment to card",Refund
+"reverse card transaction please cancel charge",Refund
+"please refund the money back to my credit card",Refund
+"charge reversed to card plz",Refund
+"card charg revers",Refund
+```
+
+##### Technical Rationale: Why Variant Augmentation Is Critical
+
+1. **BPE Vocabulary Subword Formation**:
+   NeuroGate constructs its Byte-Pair Encoding (BPE) vocabulary dynamically from corpus character-pair frequency statistics. Adding lexical clusters ensures that subword fragments (such as `revers`, `charg`, `card`) occur frequently enough to become dedicated, atomic subword tokens. This directly prevents Layer 1 single-character fragmentation (`SingleCharRatio >= 0.70`).
+2. **Positional Invariant Convex Hull**:
+   Positional encodings ($P_i$) combined with non-linear pooling create a continuous geometric manifold for each class. Providing inverted syntax (e.g. `"to my card refund charge"` vs `"refund charge to my card"`) rounds out the cluster's convex hull in vector space, drastically lowering Shannon entropy and elevating activation energy ($\text{LogSumExp}$).
+3. **Typo Resilience Without Model Bloat**:
+   Adding colloquial or typo variants (e.g. `"plz revers card"`) anchors common texting slips into the correct latent subspace without requiring multi-gigabyte language models.
+
+---
+
+#### 5.3.3. Training & Retraining Best Practices
+
+When compiling initial models or retraining existing models on harvested active learning telemetry, follow these field-tested guidelines:
+
+| Hyperparameter / Practice | Recommended Value | Engineering Rationale |
+| :--- | :--- | :--- |
+| **Minimum Samples per Intent** | `20` to `40` sentences | Prevents under-fitting and ensures sufficient pairwise subword occurrences for BPE construction. |
+| **Class Balance Ratio** | Max `2:1` imbalance | Extreme imbalance tilts Softmax baseline bias toward the over-represented class. |
+| **`TargetVocabSize`** | `200` to `350` | Too small (< 150) causes single-character fragmentation; too large (> 500 on small corpora) causes weight sparsity. |
+| **`Epochs` & Early Stopping** | `35` to `50` (`Patience = 10`) | Models typically converge in 15–25 epochs (~1.2s). Built-in patience halts training when validation loss plateaus. |
+| **`LearningRate`** | `0.003` to `0.005` | Optimal step size for the internal Adam optimizer over the 64-D embedding manifold. |
+| **`BatchSize`** | `16` to `32` | Matches zero-allocation CPU cache lines and accelerates convergence on modern x86/ARM64 architectures. |
+| **Symbolic Soft-Bias (`WithAnchor`)** | Weight: `1.3` to `2.0` | Injects 1-cycle bitmask boosts on domain-critical keywords, neutralizing edge-case ambiguity. |
+
+##### Automated Active Learning Retraining Pipeline
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+
+	neurogate "github.com/gluedays-cyber/neurogate/pkg/neurogate"
+)
+
+func RetrainPipeline(router *neurogate.Router, dataPath, weightPath string) error {
+	// 1. Drain harvested telemetry events
+	events := router.DrainTelemetry()
+	if len(events) == 0 {
+		return nil
+	}
+
+	// 2. Filter rejected or ambiguous queries for human review / auto-labeling
+	f, err := os.OpenFile(dataPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, ev := range events {
+		if ev.IsFallback || ev.IsAmbiguous {
+			// In production, human annotator or verified ground-truth assigns label:
+			// Example: f.WriteString(fmt.Sprintf("\n\"%s\",%s", ev.InputText, verifiedLabel))
+		}
+	}
+
+	// 3. Re-train Little-Endian neural model in ~1.5s
+	samples, err := neurogate.LoadCSVDataset(dataPath)
+	if err != nil {
+		return err
+	}
+
+	cfg := neurogate.DefaultTrainConfig()
+	cfg.Epochs = 40
+	cfg.LearningRate = 0.003
+	cfg.TargetVocabSize = 256
+
+	newModel, err := neurogate.TrainModel(samples, cfg)
+	if err != nil {
+		return err
+	}
+
+	// 4. Save new binary weights
+	if err := neurogate.SaveBinaryModel(weightPath, newModel); err != nil {
+		return err
+	}
+
+	// 5. Zero-downtime atomic hot-swap on live traffic (0 ns stop-the-world)
+	return router.Reload(weightPath)
+}
 ```
 
 ---

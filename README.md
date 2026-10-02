@@ -294,6 +294,72 @@ fmt.Printf("Harvested %d drift events for active learning retraining.\n", len(ev
 
 ---
 
+## Fail-Safe Safe Rejection & Active Learning Retraining Guide
+
+NeuroGate v1.1.0 does not force classification on unlearned, out-of-domain (OOD), or high-entropy queries. Instead, it enforces **Safe Rejection**:
+
+```
+[ Unlearned / OOD Query ]
+           │
+           ▼
+[ Layer 1 / Layer 2 Guardrails ] ──(Triggered)──> [ Safe Rejection & Fallback Isolation ]
+                                                            │
+                                                            ▼
+                                              [ Active Learning Buffer ]
+                                                            │
+                                                            ▼
+                                              [ Human Review & Labeling ]
+                                                            │
+                                                            ▼
+                                              [ Dataset CSV + Variants ]
+                                                            │
+                                                            ▼
+                                              [ Re-Compile & 0ns Reload ] ──> Processed Confidently in ~30 μs!
+```
+
+### 1. Handling Rejected Queries & Post-Retraining Resolution
+
+When a query is rejected (e.g. `ErrUnlearnedVocabulary`, `ErrOutOfDomain`, or isolated to `Fallback`), the engine safely isolates execution rather than triggering unauthorized actions. 
+
+1. **Harvest Rejected Queries**: Retrieve isolated inputs via telemetry (`DrainTelemetry()`) or fallback logger.
+2. **Assign Ground-Truth Label**: Human reviewers verify the true business intent (e.g. marking an unlearned query as `Refund`).
+3. **Append to Dataset**: Add the labeled statement to `dataset.csv`.
+4. **Recompile & Atomic Reload**: Re-train model in ~1.5s and call `router.Reload("weights/model.bin")` or `gate.SwapModel(newModel)`.
+5. **Immediate Resolution**: Subsequent occurrences of this query and its linguistic variations will be routed with microsecond latency and high confidence without falling back.
+
+### 2. Best Practice: Augment with Similar Variants & Typo Patterns
+
+When adding an unlearned query to the dataset, **do not add only a single sentence**. Adding 3 to 5 similar phrasing variants and common typo mutations alongside the original query significantly improves model robustness:
+
+| Strategy | Query to Add | Why It Matters |
+| :--- | :--- | :--- |
+| **Original Rejected Query** | `"charge reversed to card plz"` | Captures the exact novel phrasing rejected by Layer 1/2. |
+| **Synonym & Lexical Variants** | `"reverse the card transaction"`, `"credit back my card"` | Expands the BPE subword dictionary with diverse domain tokens. |
+| **Inverted Syntax Variants** | `"to my card please refund charge"`, `"my card needs reverse charge"` | Trains Positional Encoding ($P_i$) to handle arbitrary grammatical order. |
+| **Colloquial / Typo Variants** | `"card charg revers"`, `"plz revers card"` | Prevents future single-character fallback cutoff on messy mobile typing. |
+
+> **Why Variant Augmentation Works**: NeuroGate's in-memory BPE tokenizer constructs subwords based on frequency statistics. Adding lexical clusters ensures that subword fragments (e.g., `revers`, `charg`, `card`) become atomic vocabulary items, preventing Layer 1 single-character fragmentation and building a tight, convex manifold in the latent vector space.
+
+### 3. Model Training & Retraining Tips
+
+1. **Maintain Balanced Class Representation**:
+   - Ensure each class has roughly equal sample counts (minimum 20–30 sentences per intent).
+   - Extreme class imbalance (> 3:1 ratio) can tilt Softmax priors toward the majority class.
+2. **Tune `TargetVocabSize` to Domain Scope**:
+   - Set between `200` and `350` for standard business domain routing.
+   - If set too low (< 120), text breaks into raw 1-character fragments and triggers Layer 1 rejection.
+   - If set too high (> 500) on a small dataset, embedding weights become sparse and prone to over-fitting.
+3. **Hyperparameter Recommendations**:
+   - `Epochs`: `35` to `50` (leveraging built-in `Patience = 10` early stopping).
+   - `LearningRate`: `0.003` to `0.005` (with Adam optimizer).
+   - `BatchSize`: `16` to `32`.
+4. **Combine with Neuro-Symbolic Anchors (`WithAnchor`)**:
+   - For mission-critical keywords (e.g., `"refund"`, `"charge"`, `"card"`), register anchor weights (`1.3` to `2.0`). This guarantees instantaneous 1-cycle bitmask logit boosting even on edge-case phrasing.
+5. **Zero-Downtime Atomic Hot-Swapping**:
+   - Use `router.Reload(path)` or `gate.SwapModel(model)` to apply re-trained weights live on active traffic with `0 ns` stop-the-world overhead.
+
+---
+
 ## Observability & Whitebox Debugging
 
 Need to understand why a query routed to a specific branch or why it fell back? Use `Inspect`:

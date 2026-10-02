@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -149,6 +150,15 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 	for _, tc := range suite.TestCases {
 		trace := gate.Inspect(tc.Query)
 
+		// v1.1.0 Layer 1 Tokenizer Unlearned Vocabulary Check (< 1 μs)
+		tokens := inMemModel.Tokenizer.Encode(tc.Query)
+		singleRatio, unkRatio := inMemModel.Tokenizer.AnalyzeUnlearnedRatio(tokens)
+		if len(tokens) >= 2 && suite.Policy.MaxSingleCharRatio > 0.0 && singleRatio >= suite.Policy.MaxSingleCharRatio {
+			trace.IsFallback = true
+			trace.FallbackReason = fmt.Sprintf("unlearned vocabulary cutoff (single-char ratio %.2f >= %.2f, unk ratio %.2f)",
+				singleRatio, suite.Policy.MaxSingleCharRatio, unkRatio)
+		}
+
 		// Measure loop latency
 		start := time.Now()
 		for i := 0; i < 500; i++ {
@@ -159,16 +169,24 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 		routedLabel := trace.PredictedLabel
 		if trace.IsPipeline {
 			routedLabel = fmt.Sprintf("Pipeline (%s -> %s)", trace.PredictedLabel, trace.SecondaryLabel)
-		} else if trace.IsOOD {
-			routedLabel = fmt.Sprintf("OOD Fallback (%s)", trace.PredictedLabel)
+		} else if trace.IsOOD || trace.IsFallback {
+			routedLabel = fmt.Sprintf("Safe Rejection (%s)", trace.PredictedLabel)
 		}
 
 		fmt.Printf("  • User Input : \"%s\"\n", tc.Query)
 		fmt.Printf("    Expected   : %s\n", tc.Expectation)
-		fmt.Printf("    Inference  : %s (Confidence: %.2f%%, Cosine: %.4f, Entropy: %.4f, Energy: %.2f, Latency: %.2f μs, OOD: %t)\n",
-			routedLabel, trace.Confidence*100, trace.CosineSimilarity, trace.Entropy, trace.FreeEnergy, iterLatency, trace.IsOOD)
+		fmt.Printf("    Inference  : %s (Confidence: %.2f%%, SingleRatio: %.2f, Cosine: %.4f, Entropy: %.4f, Energy: %.2f, Latency: %.2f μs, OOD: %t)\n",
+			routedLabel, trace.Confidence*100, singleRatio, trace.CosineSimilarity, trace.Entropy, trace.FreeEnergy, iterLatency, trace.IsOOD)
 
-		_ = gate.FilterPipeline(ctx, tc.Query, nil)
+		if trace.IsFallback || trace.IsOOD {
+			fmt.Println("    [FAIL-SAFE STATUS] Forced classification intercepted by NeuroGate guardrails.")
+			if trace.FallbackReason != "" {
+				fmt.Printf("    [GUARD REASON]     %s\n", trace.FallbackReason)
+			}
+			_ = gate.Filter(ctx, "0000000000000000_unlearned_ood_quarantine_fallback", tc.Query)
+		} else {
+			_ = gate.FilterPipeline(ctx, tc.Query, nil)
+		}
 		fmt.Println()
 	}
 
@@ -184,8 +202,8 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 
 func demonstrateRouter(ctx context.Context, epochs int) {
 	fmt.Printf("\n================================================================================\n")
-	fmt.Println("  DEMONSTRATION: High-Level 3-Tier Router & Continuous Branching")
-	fmt.Println("  Capability   : Basic baseline showcasing on-the-fly compilation and 3-tier dispatch")
+	fmt.Println("  DEMONSTRATION: High-Level 3-Tier Router & Continuous Branching (v1.1.0)")
+	fmt.Println("  Capability   : On-the-fly compilation, 2-Layer Fail-Safe, and RouteQuery Sentinel Errors")
 	fmt.Printf("================================================================================\n")
 
 	dataPath := "data/sample_dataset.csv"
@@ -211,8 +229,15 @@ func demonstrateRouter(ctx context.Context, epochs int) {
 			fmt.Printf("    [ACTION: Account]  Account authentication & password reset: '%v'\n", payload)
 			return nil
 		}).
+		Ambiguous(func(ctx context.Context, primary, secondary string, payload any) error {
+			fmt.Printf("    [ROUTER FAIL-SAFE: AMBIGUOUS ACTION] Competing candidates (%s vs %s): Customer confirmation requested\n", primary, secondary)
+			fmt.Println("    [ACTIVE LEARNING RETRAINING] User selection captured to sharpen margin boundary")
+			return nil
+		}).
 		Fallback(func(ctx context.Context, payload any) error {
-			fmt.Printf("    [FALLBACK: Safety] Isolated low-confidence/OOD query: '%v'\n", payload)
+			fmt.Printf("    [ROUTER FAIL-SAFE: ISOLATED ACTION] Out-of-Domain or unlearned query safely quarantined: '%v'\n", payload)
+			fmt.Println("    [HUMAN TRIAGE REQUIRED] Manual review requested to classify unrecognized intent")
+			fmt.Println("    [ACTIVE LEARNING RETRAINING] Enqueued to active learning buffer for retraining")
 			return nil
 		})
 
@@ -222,6 +247,7 @@ func demonstrateRouter(ctx context.Context, epochs int) {
 		"Forgot my account password please reset",
 		"Please refund my purchase",
 		"Track my shipment status",
+		"xzqjwpkvmcty1837",
 		"Completely random gibberish noise 12345!@#$",
 		"got charged twice on my card, refund the extra charge asap",
 		"cant log into my acct keeps saying wrong password",
@@ -229,12 +255,51 @@ func demonstrateRouter(ctx context.Context, epochs int) {
 		"yo i typed the wrong apt number, can someone update the address before it ships",
 	}
 
-	fmt.Printf("\n>>> [STAGE 2: AI-POWERED 3-TIER ROUTER DISPATCH]\n")
+	fmt.Printf("\n>>> [STAGE 2: AI-POWERED 3-TIER ROUTER DISPATCH & ROUTEQUERY FAIL-SAFE]\n")
 	for _, query := range testQueries {
 		trace := router.Inspect(query)
 		fmt.Printf("  • User Input : \"%s\"\n", query)
-		fmt.Printf("    Prediction : %s (Confidence: %.2f%%, Entropy: %.4f, Latency: %d μs)\n",
-			trace.PredictedLabel, trace.Confidence*100, trace.Entropy, trace.LatencyMicros)
+		fmt.Printf("    Prediction : %s (Confidence: %.2f%%, SingleRatio: %.2f, Entropy: %.4f, Energy: %.2f, Latency: %d μs)\n",
+			trace.PredictedLabel, trace.Confidence*100, trace.SingleCharRatio, trace.Entropy, trace.Energy, trace.LatencyMicros)
+
+		// v1.1.0 RouteQuery 2-Layer Fail-Safe Sentinel Error Check
+		decision, rErr := router.RouteQuery(ctx, query)
+		if rErr != nil {
+			switch {
+			case errors.Is(rErr, neurogate.ErrUnlearnedVocabulary):
+				fmt.Printf("    [ROUTE-QUERY: Layer 1 Cutoff] ErrUnlearnedVocabulary (< 1 μs fast rejection): %v\n", rErr)
+				fmt.Println("    [FAIL-SAFE INTERCEPTION] Unlearned slang/novel glyphs intercepted before matrix multiplications")
+				fmt.Println("    [HUMAN REVIEW REQUIRED] Operator verification required for unrecognized vocabulary")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Sample enqueued for vocabulary expansion & retraining")
+			case errors.Is(rErr, neurogate.ErrOutOfDomain):
+				fmt.Printf("    [ROUTE-QUERY: Layer 2 Cutoff] ErrOutOfDomain (Free energy violation): %v\n", rErr)
+				fmt.Println("    [FAIL-SAFE INTERCEPTION] Out-of-distribution query isolated to prevent erroneous dispatch")
+				fmt.Println("    [HUMAN REVIEW REQUIRED] Operator routing decision requested")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Boundary shift detected; added to active learning pool")
+			case errors.Is(rErr, neurogate.ErrLowConfidence):
+				fmt.Printf("    [ROUTE-QUERY: Layer 2 Cutoff] ErrLowConfidence (Score below low threshold): %v\n", rErr)
+				fmt.Println("    [FAIL-SAFE INTERCEPTION] Low probability execution prevented")
+				fmt.Println("    [HUMAN REVIEW REQUIRED] Manual review needed to determine true domain intent")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Marked for supervised sample augmentation & retraining")
+			case errors.Is(rErr, neurogate.ErrHighEntropy):
+				fmt.Printf("    [ROUTE-QUERY: Layer 2 Cutoff] ErrHighEntropy (Uncertainty boundary exceeded): %v\n", rErr)
+				fmt.Println("    [FAIL-SAFE INTERCEPTION] Chaotic probability distribution suppressed")
+				fmt.Println("    [HUMAN REVIEW REQUIRED] Ambiguous distribution requires human verification")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Added to drift retraining queue")
+			case errors.Is(rErr, neurogate.ErrAmbiguousIntent):
+				fmt.Printf("    [ROUTE-QUERY: Layer 2 Margin] ErrAmbiguousIntent (%s vs %s): %v\n",
+					decision.Intent, decision.SecondaryIntent, rErr)
+				fmt.Printf("    [HUMAN REVIEW REQUIRED] Two competing candidates detected; requesting customer confirmation\n")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Decision will be recorded to fine-tune decision boundaries")
+			default:
+				fmt.Printf("    [ROUTE-QUERY: Error] %v\n", rErr)
+			}
+		} else {
+			fmt.Printf("    [ROUTE-QUERY: Confident] Intent: %s (Confidence: %.2f%%, Margin: %.2f)\n",
+				decision.Intent, decision.Confidence*100, decision.Margin)
+		}
+
+		// Callback-based 3-tier dispatch
 		if err := router.Dispatch(ctx, query, query); err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}
@@ -296,14 +361,16 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_cs.bin",
 			DataPath:    "data/demo_cs.csv",
 			Description: "Solves opposite intents from inverted word orders and handles return->reship pipelines.",
-			Policy: neurogate.DispatchPolicy{
-				HighThreshold:     0.70,
-				LowThreshold:      0.35,
-				MarginCutoff:      0.15,
-				MaxEntropy:        0.70,
-				PipelineThreshold: 0.25,
-				MinLogSumExp:      7.0,
-			},
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.HighThreshold = 0.70
+				p.LowThreshold = 0.35
+				p.MarginCutoff = 0.15
+				p.MaxEntropy = 0.70
+				p.PipelineThreshold = 0.25
+				p.MinLogSumExp = 7.0
+				return p
+			}(),
 			MinCosine: 0.35,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("Refund", func(ctx context.Context, payload any) error {
@@ -333,10 +400,14 @@ func getDomainSuites() map[string]DomainSuite {
 				g.BindPipeline("Refund", "Delivery", pipelineHandler).
 					BindPipeline("Delivery", "Refund", pipelineHandler).
 					Ambiguous(func(ctx context.Context, p, s string, payload any) error {
-						fmt.Printf("    [AMBIGUOUS: %s vs %s] Borderline confidence: Requesting customer confirmation\n", p, s)
+						fmt.Printf("    [CS FAIL-SAFE: AMBIGUOUS INTERCEPTION] Borderline margin (%s vs %s): Customer clarification requested\n", p, s)
+						fmt.Println("    [HUMAN REVIEW REQUIRED] Request customer confirmation popup to resolve conflict")
+						fmt.Println("    [ACTIVE LEARNING RETRAINING] User selection captured to sharpen margin boundary on retraining")
 						return nil
 					}).Fallback(func(ctx context.Context, payload any) error {
-						fmt.Println("    [FALLBACK] Out-of-Domain query safely isolated to human tier-2 support")
+						fmt.Println("    [CS FAIL-SAFE: SAFE REJECTION] Forced classification blocked! Unauthorized refund/reship intercepted")
+						fmt.Println("    [HUMAN TRIAGE REQUIRED] Unlearned or OOD inquiry routed to Tier-2 Human Agent for manual review")
+						fmt.Println("    [ACTIVE LEARNING RETRAINING] Novel inquiry added to CS retraining corpus")
 						return nil
 					})
 			},
@@ -347,7 +418,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "my credit card was declined at checkout with transaction error code 402", Expectation: "Definite Payment"},
 				{Query: "i returned the box please update delivery", Expectation: "Multi-Intent Pipeline (Refund -> Delivery)"},
 				{Query: "refund delivery", Expectation: "Positional XOR Sequence Disambiguation"},
-				{Query: "what is the meaning of quantum black holes", Expectation: "OOD / Fallback Isolation"},
+				{Query: "asdfghjklqwerty12345", Expectation: "Fail-Safe: Layer 1 Unlearned Token Rejection (Safe Rejection & Retrain)"},
+				{Query: "what is the meaning of quantum black holes", Expectation: "Fail-Safe: Layer 2 OOD Isolation (Safe Rejection & Retrain)"},
+				{Query: "refund order or deliver again i am completely undecided", Expectation: "Fail-Safe: Layer 2 Ambiguity (Customer Clarification & Retrain)"},
 			},
 		},
 		"llm": {
@@ -355,14 +428,16 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_llm.bin",
 			DataPath:    "data/demo_llm.csv",
 			Description: "Resolves routine banking intents locally in ~30 μs at $0; escalates OOD queries to Cloud LLM.",
-			Policy: neurogate.DispatchPolicy{
-				HighThreshold:     0.75,
-				LowThreshold:      0.35,
-				MarginCutoff:      0.15,
-				MaxEntropy:        1.50,
-				PipelineThreshold: 0.30,
-				MinLogSumExp:      7.5,
-			},
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.HighThreshold = 0.75
+				p.LowThreshold = 0.35
+				p.MarginCutoff = 0.15
+				p.MaxEntropy = 1.50
+				p.PipelineThreshold = 0.30
+				p.MinLogSumExp = 7.5
+				return p
+			}(),
 			MinCosine: 0.35,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("QueryBalance", func(ctx context.Context, payload any) error {
@@ -385,8 +460,15 @@ func getDomainSuites() map[string]DomainSuite {
 					return nil
 				}).WithAnchor(1.3, "profile", "update", "address", "phone", "residential", "email")
 
-				g.Fallback(func(ctx context.Context, payload any) error {
-					fmt.Println("    [CLOUD LLM ESCAPE] High entropy OOD query forwarded to OpenAI GPT-4o (Cost: $0.02)")
+				g.Ambiguous(func(ctx context.Context, p, s string, payload any) error {
+					fmt.Printf("    [LLM FAIL-SAFE: AMBIGUOUS INTERCEPTION] Competing banking intents (%s vs %s): User disambiguation prompt emitted\n", p, s)
+					fmt.Println("    [HUMAN REVIEW REQUIRED] User confirmation required to proceed with banking action")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Ambiguous query enqueued for boundary retraining")
+					return nil
+				}).Fallback(func(ctx context.Context, payload any) error {
+					fmt.Println("    [LLM FAIL-SAFE: SAFE REJECTION] Zero-cost local engine refused forced classification")
+					fmt.Println("    [HUMAN/CLOUD ESCAPE] Safely escalated to Gemini Cloud LLM ($0.02) & queued for human supervision")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] OOD sample enqueued for active learning retraining")
 					return nil
 				})
 			},
@@ -396,8 +478,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "send five hundred dollars to john doe from checking", Expectation: "Local Bypass: TransferFunds"},
 				{Query: "freeze my debit card immediately i lost my leather wallet", Expectation: "Local Bypass: CardLock"},
 				{Query: "update my residential street address in my user profile", Expectation: "Local Bypass: UpdateProfile"},
-				{Query: "explain how quantum entanglement works in simple terms", Expectation: "Cloud LLM Fallback (OOD)"},
-				{Query: "write a python script to scrape stock prices", Expectation: "Cloud LLM Fallback (OOD)"},
+				{Query: "zzxxccvvbbnnmm998877", Expectation: "Fail-Safe: Layer 1 Noise Rejection (Safe Rejection & Retrain)"},
+				{Query: "explain how quantum entanglement works in simple terms", Expectation: "Fail-Safe: Layer 2 OOD Escape to Cloud LLM (Retrain Queued)"},
+				{Query: "transfer money or check my account balance immediately", Expectation: "Fail-Safe: Layer 2 Ambiguity (Customer Clarification)"},
 			},
 		},
 		"sre": {
@@ -405,7 +488,11 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_sre.bin",
 			DataPath:    "data/demo_sre.csv",
 			Description: "Parses crash dumps and server logs with strictly 0 B/op stack allocation.",
-			Policy:      neurogate.DefaultDispatchPolicy(),
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.MinLogSumExp = 6.0
+				return p
+			}(),
 			MinCosine:   0.30,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("OutOfMemory", func(ctx context.Context, payload any) error {
@@ -428,8 +515,15 @@ func getDomainSuites() map[string]DomainSuite {
 					return nil
 				}).WithAnchor(1.5, "health", "probe", "healthz", "200", "ok", "heartbeat", "nominal")
 
-				g.Fallback(func(ctx context.Context, payload any) error {
-					fmt.Println("    [UNKNOWN LOG] Streamed to cold storage archive")
+				g.Ambiguous(func(ctx context.Context, p, s string, payload any) error {
+					fmt.Printf("    [SRE FAIL-SAFE: AMBIGUOUS INTERCEPTION] Dual fault indicators (%s vs %s): Automatic remediation paused\n", p, s)
+					fmt.Println("    [HUMAN TRIAGE REQUIRED] SRE On-Call confirmation requested to avoid contradictory auto-actions")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Multi-fault log trace enqueued for boundary retraining")
+					return nil
+				}).Fallback(func(ctx context.Context, payload any) error {
+					fmt.Println("    [SRE FAIL-SAFE: SAFE REJECTION] Unknown log refused auto-remediation (Prevented dangerous pod restarts)")
+					fmt.Println("    [HUMAN TRIAGE REQUIRED] Pinned to SRE On-Call dashboard for manual root-cause inspection")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Unlearned crash pattern streamed to SRE retraining dataset")
 					return nil
 				})
 			},
@@ -442,6 +536,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "Fail2ban banned host 192.168.1.100 for 3600 seconds after 10 failed login attempts", Expectation: "Security AuthBruteForce"},
 				{Query: "INFO: health check probe /healthz returned 200 OK latency: 2ms", Expectation: "P3 SystemHealth"},
 				{Query: "Heartbeat ping received from worker node status healthy", Expectation: "P3 SystemHealth"},
+				{Query: "asdfghjkllogcorrupt0000000", Expectation: "Fail-Safe: Layer 1 Corrupted Byte Rejection (Safe Rejection & Retrain)"},
+				{Query: "nginx unknown alien protocol payload 0xDEADBEEF received", Expectation: "Fail-Safe: Layer 2 OOD Isolation (On-Call Engineer Review)"},
+				{Query: "fatal error runtime out of memory allocating but remaining connection slots reserved", Expectation: "Fail-Safe: Layer 2 Ambiguity (OOM vs DBPool Collision)"},
 			},
 			CustomRun: func(g *neurogate.NeuroGate, ctx context.Context) {
 				fmt.Println("    [Zero-Allocation Stack Demonstration via FilterTokens]")
@@ -464,7 +561,11 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_iot.bin",
 			DataPath:    "data/demo_iot.csv",
 			Description: "Sub-milliwatt, sub-180KB offline smart home command router with symbolic anchor soft-bias.",
-			Policy:      neurogate.DefaultDispatchPolicy(),
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.MinLogSumExp = 6.0
+				return p
+			}(),
 			MinCosine:   0.30,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("LightControl", func(ctx context.Context, payload any) error {
@@ -487,8 +588,15 @@ func getDomainSuites() map[string]DomainSuite {
 					return nil
 				}).WithAnchor(1.8, "play", "jazz", "music", "soundbar", "spotify", "song", "pause", "audio")
 
-				g.Fallback(func(ctx context.Context, payload any) error {
-					fmt.Println("    [AUDIO PROMPT] 'Sorry, I did not catch that command'")
+				g.Ambiguous(func(ctx context.Context, p, s string, payload any) error {
+					fmt.Printf("    [IOT FAIL-SAFE: VOICE RE-PROMPT] Ambiguous voice command (%s vs %s): Audio prompt emitted\n", p, s)
+					fmt.Println("    [HUMAN DECISION REQUIRED] Speaker asks: 'Did you mean to control light or temperature?'")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] User vocal reply enqueued for edge firmware retraining")
+					return nil
+				}).Fallback(func(ctx context.Context, payload any) error {
+					fmt.Println("    [IOT FAIL-SAFE: SAFE REJECTION] Unrecognized sound or OOD command rejected: Hardware motors locked safely")
+					fmt.Println("    [HUMAN CONFIRMATION REQUIRED] Speaker prompt: 'Command not recognized, please repeat'")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Edge device logged unlearned acoustic pattern for federated retraining")
 					return nil
 				})
 			},
@@ -501,6 +609,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "unlock front door deadbolt for delivery courier guest", Expectation: "DoorLock"},
 				{Query: "play smooth jazz music on living room soundbar speaker", Expectation: "MediaPlayback"},
 				{Query: "pause spotify audio playback on bedroom speaker", Expectation: "MediaPlayback"},
+				{Query: "qwertyuiopasdfghjklzxcvbnm", Expectation: "Fail-Safe: Layer 1 Voice Glitch / Unlearned Gibberish (Safe Lockout)"},
+				{Query: "order pizza with pineapple from nearby grocery store", Expectation: "Fail-Safe: Layer 2 OOD Command (Hardware Safe Lockout)"},
+				{Query: "light cooling door soundbar switch everything", Expectation: "Fail-Safe: Layer 2 Ambiguity (Voice Clarification Required)"},
 			},
 		},
 		"cicd": {
@@ -508,7 +619,11 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_cicd.bin",
 			DataPath:    "data/demo_cicd.csv",
 			Description: "Analyzes build error tail logs with symbolic keyword anchors to trigger auto-remediation.",
-			Policy:      neurogate.DefaultDispatchPolicy(),
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.MinLogSumExp = 6.0
+				return p
+			}(),
 			MinCosine:   0.30,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("NetworkTimeoutRetry", func(ctx context.Context, payload any) error {
@@ -531,8 +646,15 @@ func getDomainSuites() map[string]DomainSuite {
 					return nil
 				}).WithAnchor(1.6, "cache", "clean", "corrupted", "build", "checksum", "sha256")
 
-				g.Fallback(func(ctx context.Context, payload any) error {
-					fmt.Println("    [MANUAL TRIAGE] Flag build for human DevOps on-call review")
+				g.Ambiguous(func(ctx context.Context, p, s string, payload any) error {
+					fmt.Printf("    [CICD FAIL-SAFE: MERGE BLOCKED] Build failure signals conflict (%s vs %s): Pipeline frozen\n", p, s)
+					fmt.Println("    [HUMAN TRIAGE REQUIRED] Author & DevOps manual inspection required before re-triggering")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Ambiguous build trace saved to CI/CD retraining corpus")
+					return nil
+				}).Fallback(func(ctx context.Context, payload any) error {
+					fmt.Println("    [CICD FAIL-SAFE: SAFE REJECTION] Unrecognized build failure: Automatic rollback/scaleup suppressed")
+					fmt.Println("    [HUMAN TRIAGE REQUIRED] DevOps On-Call ticket generated for manual diagnosis")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Novel failure signature enqueued for classifier retraining")
 					return nil
 				})
 			},
@@ -545,6 +667,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "cannot use variable of type string as type int in argument to processTransaction", Expectation: "Notify-Dev: CodeSyntaxAlert"},
 				{Query: "corrupted go build cache detected in /root/.cache/go-build please clean", Expectation: "Evict-Cache: CacheEvict"},
 				{Query: "checksum mismatch for cached layer sha256:4a8b invalid local tar", Expectation: "Evict-Cache: CacheEvict"},
+				{Query: "0xDEADBEEFUNKNOWNBYTECODE", Expectation: "Fail-Safe: Layer 1 Binary Tail Cutoff (Safe Suppression)"},
+				{Query: "lunch was delicious today at the cafeteria", Expectation: "Fail-Safe: Layer 2 OOD Tail Log (DevOps Manual Review)"},
+				{Query: "syntax error timeout connect retry virtual memory exhausted", Expectation: "Fail-Safe: Layer 2 Ambiguous Collision (Pipeline Freeze)"},
 			},
 		},
 		"fintech": {
@@ -552,13 +677,16 @@ func getDomainSuites() map[string]DomainSuite {
 			ModelPath:   "weights/demo_fintech.bin",
 			DataPath:    "data/demo_fintech.csv",
 			Description: "Real-time remittance inspection for scam interception with high-risk symbolic anchors.",
-			Policy: neurogate.DispatchPolicy{
-				HighThreshold:     0.70,
-				LowThreshold:      0.35,
-				MarginCutoff:      0.15,
-				MaxEntropy:        2.0,
-				PipelineThreshold: 0.30,
-			},
+			Policy: func() neurogate.DispatchPolicy {
+				p := neurogate.DefaultDispatchPolicy()
+				p.HighThreshold = 0.70
+				p.LowThreshold = 0.35
+				p.MarginCutoff = 0.15
+				p.MaxEntropy = 2.0
+				p.PipelineThreshold = 0.30
+				p.MinLogSumExp = 7.0
+				return p
+			}(),
 			MinCosine: 0.30,
 			SetupGate: func(g *neurogate.NeuroGate) {
 				g.Bind("NormalTransfer", func(ctx context.Context, payload any) error {
@@ -582,10 +710,14 @@ func getDomainSuites() map[string]DomainSuite {
 				}).WithAnchor(1.8, "acquisition", "escrow", "million", "tranche", "corporate", "commercial", "estate")
 
 				g.Ambiguous(func(ctx context.Context, p, s string, payload any) error {
-					fmt.Printf("    [STEP-UP 2FA] Ambiguous memo (%s vs %s): SMS OTP challenge required\n", p, s)
+					fmt.Printf("    [FINTECH FAIL-SAFE: STEP-UP 2FA] Ambiguous high-risk memo (%s vs %s): ACH wire halted\n", p, s)
+					fmt.Println("    [HUMAN DECISION REQUIRED] SMS OTP challenge sent to sender; dual-compliance sign-off requested")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Borderline transaction tagged for fraud model boundary retraining")
 					return nil
 				}).Fallback(func(ctx context.Context, payload any) error {
-					fmt.Println("    [MANUAL AUDIT] Route wire memo to fraud investigations team")
+					fmt.Println("    [FINTECH FAIL-SAFE: SAFE REJECTION] Wire execution blocked: Unlearned or high-entropy anomaly detected")
+					fmt.Println("    [HUMAN TRIAGE REQUIRED] Remittance routed to Anti-Money Laundering (AML) officer desk for audit")
+					fmt.Println("    [ACTIVE LEARNING RETRAINING] Anomaly memo quarantined and enqueued for AML retraining dataset")
 					return nil
 				})
 			},
@@ -598,6 +730,9 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "unauthorized recurring subscription charge from merchant after cancellation", Expectation: "Dispute: ChargebackDispute"},
 				{Query: "corporate acquisition escrow settlement tranche wire five million dollars", Expectation: "AML Audit: HighValueAudit"},
 				{Query: "commercial real estate property purchase closing escrow wire transfer", Expectation: "AML Audit: HighValueAudit"},
+				{Query: "bbccddffgghhjjkkll112233", Expectation: "Fail-Safe: Layer 1 Obfuscated Garbage Memo (Safe Freeze & Retrain)"},
+				{Query: "buy spaceships on mars with extraterrestrial coins", Expectation: "Fail-Safe: Layer 2 OOD Remittance (AML Safe Freeze)"},
+				{Query: "urgent lunch reimbursement wire five million dollars immediately", Expectation: "Fail-Safe: Layer 2 High-Risk Ambiguity (Step-up 2FA Challenge)"},
 			},
 		},
 	}
