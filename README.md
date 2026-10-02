@@ -1,6 +1,7 @@
 # NeuroGate Demos
-<img src="https://github.com/user-attachments/assets/3413a486-d71c-4285-841d-76bbe74f830a" width="226" height="200" alt="Image" align="right" style="margin-left: 15px; margin: 10px;">
 <p align="center">
+  <img src="https://github.com/gluedays-cyber/neurogate/raw/main/assets/neurogate-hero.jpg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
+</p>
   <strong>Interactive On-The-Fly Training & Live Branching Showcases in Pure Go</strong><br>
   <em>Enterprise demonstration suite for <a href="https://github.com/gluedays-cyber/neurogate"><strong>NeuroGate</strong></a>. Creates domain artificial intelligence from scratch in ~1.5s, routing execution flow in ~30 μs with 0 B/op (Zero Allocations), Zero Downloads, and Zero CGO.</em>
 </p>
