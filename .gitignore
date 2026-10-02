@@ -1,0 +1,15 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Compiled neural weights
+weights/
+*.bin
+
+# Environment / IDE
+.vscode/
+.idea/
