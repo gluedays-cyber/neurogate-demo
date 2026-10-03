@@ -131,13 +131,20 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 	// 2. Initialize NeuroGate directly from the freshly trained in-memory model
 	gate := neurogate.NewNeuroGateWithModel(inMemModel)
 	gate.SetPolicy(suite.Policy)
-	if suite.MinCosine > 0 {
-		gate.SetMinCosineSim(suite.MinCosine)
+	gate.SetMaxAnchorBoost(3.0) // v2.5.0 Clamping Guard against anchor logit explosion
+
+	// Calibrate domain manifold centroid & dynamic distribution (v2.5.0)
+	if samples, err := neurogate.LoadCSVDataset(suite.DataPath); err == nil {
+		gate.CalibrateDomainDistribution(samples, 3.0)
+		hasCentroid, meanSim, stdDev, minCosine := gate.DomainStats()
+		if hasCentroid {
+			fmt.Printf("    [MANIFOLD CALIBRATION] Mean Sim: %.4f | StdDev: %.4f | Adaptive MinCosine: %.4f\n",
+				meanSim, stdDev, minCosine)
+		}
 	}
 
-	// Calibrate domain manifold centroid
-	if samples, err := neurogate.LoadCSVDataset(suite.DataPath); err == nil {
-		gate.CalibrateDomainCentroid(samples)
+	if suite.MinCosine > 0 {
+		gate.SetMinCosineSim(suite.MinCosine)
 	}
 
 	// 3. Bind symbolic anchors and enterprise Go action handlers
@@ -150,10 +157,16 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 	for _, tc := range suite.TestCases {
 		trace := gate.Inspect(tc.Query)
 
-		// v1.1.0 Layer 1 Tokenizer Unlearned Vocabulary Check (< 1 μs)
+		// v2.5.0 Layer 1 Tokenizer Guard: Repetitive Flood & Unlearned Vocabulary Check (< 1 μs)
 		tokens := inMemModel.Tokenizer.Encode(tc.Query)
 		singleRatio, unkRatio := inMemModel.Tokenizer.AnalyzeUnlearnedRatio(tokens)
-		if len(tokens) >= 2 && suite.Policy.MaxSingleCharRatio > 0.0 && singleRatio >= suite.Policy.MaxSingleCharRatio {
+		uniqueRatio := neurogate.CalculateUniqueTokenRatio(tokens)
+
+		if len(tokens) >= 4 && suite.Policy.MinUniqueTokenRatio > 0.0 && uniqueRatio < suite.Policy.MinUniqueTokenRatio {
+			trace.IsFallback = true
+			trace.FallbackReason = fmt.Sprintf("repetitive pattern flood cutoff (unique ratio %.2f < %.2f)",
+				uniqueRatio, suite.Policy.MinUniqueTokenRatio)
+		} else if len(tokens) >= 2 && suite.Policy.MaxSingleCharRatio > 0.0 && singleRatio >= suite.Policy.MaxSingleCharRatio {
 			trace.IsFallback = true
 			trace.FallbackReason = fmt.Sprintf("unlearned vocabulary cutoff (single-char ratio %.2f >= %.2f, unk ratio %.2f)",
 				singleRatio, suite.Policy.MaxSingleCharRatio, unkRatio)
@@ -171,19 +184,21 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 			routedLabel = fmt.Sprintf("Pipeline (%s -> %s)", trace.PredictedLabel, trace.SecondaryLabel)
 		} else if trace.IsOOD || trace.IsFallback {
 			routedLabel = fmt.Sprintf("Safe Rejection (%s)", trace.PredictedLabel)
+		} else if trace.IsAmbiguous {
+			routedLabel = fmt.Sprintf("Ambiguous (%s vs %s)", trace.PredictedLabel, trace.SecondaryLabel)
 		}
 
 		fmt.Printf("  • User Input : \"%s\"\n", tc.Query)
 		fmt.Printf("    Expected   : %s\n", tc.Expectation)
-		fmt.Printf("    Inference  : %s (Confidence: %.2f%%, SingleRatio: %.2f, Cosine: %.4f, Entropy: %.4f, Energy: %.2f, Latency: %.2f μs, OOD: %t)\n",
-			routedLabel, trace.Confidence*100, singleRatio, trace.CosineSimilarity, trace.Entropy, trace.FreeEnergy, iterLatency, trace.IsOOD)
+		fmt.Printf("    Inference  : %s (Confidence: %.2f%%, UniqueRatio: %.2f, SingleRatio: %.2f, Cosine: %.4f, Entropy: %.4f, Energy: %.2f, Latency: %.2f μs, OOD: %t)\n",
+			routedLabel, trace.Confidence*100, uniqueRatio, singleRatio, trace.CosineSimilarity, trace.Entropy, trace.FreeEnergy, iterLatency, trace.IsOOD)
 
 		if trace.IsFallback || trace.IsOOD {
 			fmt.Println("    [FAIL-SAFE STATUS] Forced classification intercepted by NeuroGate guardrails.")
 			if trace.FallbackReason != "" {
 				fmt.Printf("    [GUARD REASON]     %s\n", trace.FallbackReason)
 			}
-			_ = gate.Filter(ctx, "0000000000000000_unlearned_ood_quarantine_fallback", tc.Query)
+			_ = gate.Filter(ctx, "", tc.Query)
 		} else {
 			_ = gate.FilterPipeline(ctx, tc.Query, nil)
 		}
@@ -202,7 +217,7 @@ func demonstrateDomain(ctx context.Context, suite DomainSuite, epochs int) {
 
 func demonstrateRouter(ctx context.Context, epochs int) {
 	fmt.Printf("\n================================================================================\n")
-	fmt.Println("  DEMONSTRATION: High-Level 3-Tier Router & Continuous Branching (v1.1.0)")
+	fmt.Println("  DEMONSTRATION: High-Level 3-Tier Router & Continuous Branching (v2.5.0)")
 	fmt.Println("  Capability   : On-the-fly compilation, 2-Layer Fail-Safe, and RouteQuery Sentinel Errors")
 	fmt.Printf("================================================================================\n")
 
@@ -247,6 +262,7 @@ func demonstrateRouter(ctx context.Context, epochs int) {
 		"Forgot my account password please reset",
 		"Please refund my purchase",
 		"Track my shipment status",
+		"refund refund refund refund refund refund",
 		"xzqjwpkvmcty1837",
 		"Completely random gibberish noise 12345!@#$",
 		"got charged twice on my card, refund the extra charge asap",
@@ -259,13 +275,18 @@ func demonstrateRouter(ctx context.Context, epochs int) {
 	for _, query := range testQueries {
 		trace := router.Inspect(query)
 		fmt.Printf("  • User Input : \"%s\"\n", query)
-		fmt.Printf("    Prediction : %s (Confidence: %.2f%%, SingleRatio: %.2f, Entropy: %.4f, Energy: %.2f, Latency: %d μs)\n",
-			trace.PredictedLabel, trace.Confidence*100, trace.SingleCharRatio, trace.Entropy, trace.Energy, trace.LatencyMicros)
+		fmt.Printf("    Prediction : %s (Confidence: %.2f%%, UniqueRatio: %.2f, SingleRatio: %.2f, Entropy: %.4f, Energy: %.2f, Latency: %d μs)\n",
+			trace.PredictedLabel, trace.Confidence*100, trace.UniqueTokenRatio, trace.SingleCharRatio, trace.Entropy, trace.Energy, trace.LatencyMicros)
 
-		// v1.1.0 RouteQuery 2-Layer Fail-Safe Sentinel Error Check
+		// v2.5.0 RouteQuery 2-Layer Fail-Safe Sentinel Error Check
 		decision, rErr := router.RouteQuery(ctx, query)
 		if rErr != nil {
 			switch {
+			case errors.Is(rErr, neurogate.ErrDegeneratedInput):
+				fmt.Printf("    [ROUTE-QUERY: Layer 1 Flood Cutoff] ErrDegeneratedInput (< 1 μs rejection): %v\n", rErr)
+				fmt.Printf("    [FAIL-SAFE INTERCEPTION] Repetitive token flood attack detected (Unique Ratio: %.2f%%)\n", decision.UniqueTokenRatio*100)
+				fmt.Println("    [SECURITY QUARANTINE] Isolated malicious repetitive payload without neural forward pass")
+				fmt.Println("    [ACTIVE LEARNING QUEUED] Flooding pattern logged to telemetry buffer")
 			case errors.Is(rErr, neurogate.ErrUnlearnedVocabulary):
 				fmt.Printf("    [ROUTE-QUERY: Layer 1 Cutoff] ErrUnlearnedVocabulary (< 1 μs fast rejection): %v\n", rErr)
 				fmt.Println("    [FAIL-SAFE INTERCEPTION] Unlearned slang/novel glyphs intercepted before matrix multiplications")
@@ -369,6 +390,7 @@ func getDomainSuites() map[string]DomainSuite {
 				p.MaxEntropy = 0.70
 				p.PipelineThreshold = 0.25
 				p.MinLogSumExp = 7.0
+				p.MinUniqueTokenRatio = 0.40 // v2.5.0 strict repetitive flood cutoff
 				return p
 			}(),
 			MinCosine: 0.35,
@@ -418,6 +440,7 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "my credit card was declined at checkout with transaction error code 402", Expectation: "Definite Payment"},
 				{Query: "i returned the box please update delivery", Expectation: "Multi-Intent Pipeline (Refund -> Delivery)"},
 				{Query: "refund delivery", Expectation: "Positional XOR Sequence Disambiguation"},
+				{Query: "refund refund refund refund refund refund refund refund refund refund", Expectation: "Fail-Safe: Layer 1 Repetitive Token Flood (Safe Rejection & Retrain)"},
 				{Query: "asdfghjklqwerty12345", Expectation: "Fail-Safe: Layer 1 Unlearned Token Rejection (Safe Rejection & Retrain)"},
 				{Query: "what is the meaning of quantum black holes", Expectation: "Fail-Safe: Layer 2 OOD Isolation (Safe Rejection & Retrain)"},
 				{Query: "refund order or deliver again i am completely undecided", Expectation: "Fail-Safe: Layer 2 Ambiguity (Customer Clarification & Retrain)"},
@@ -435,11 +458,12 @@ func getDomainSuites() map[string]DomainSuite {
 				p.MarginCutoff = 0.15
 				p.MaxEntropy = 1.50
 				p.PipelineThreshold = 0.30
-				p.MinLogSumExp = 7.5
+				p.MinLogSumExp = 4.0
 				return p
 			}(),
 			MinCosine: 0.35,
 			SetupGate: func(g *neurogate.NeuroGate) {
+				g.SetTemperature(3.5) // Calibrate overfitted neural logits for natural ambiguity detection
 				g.Bind("QueryBalance", func(ctx context.Context, payload any) error {
 					fmt.Println("    [LOCAL BYPASS] Retrieved balance from in-memory cache in 30 μs (Cost: $0.00)")
 					return nil
@@ -448,7 +472,7 @@ func getDomainSuites() map[string]DomainSuite {
 				g.Bind("TransferFunds", func(ctx context.Context, payload any) error {
 					fmt.Println("    [LOCAL BYPASS] Dispatched ledger wire transaction directly (Cost: $0.00)")
 					return nil
-				}).WithAnchor(1.3, "transfer", "send", "dollars", "wire", "remit")
+				}).WithAnchor(1.5, "transfer", "send", "dollars", "wire", "remit").Inhibit(9.0, "QueryBalance")
 
 				g.Bind("CardLock", func(ctx context.Context, payload any) error {
 					fmt.Println("    [LOCAL BYPASS] Instant freeze signal transmitted to card network (Cost: $0.00)")
@@ -564,6 +588,7 @@ func getDomainSuites() map[string]DomainSuite {
 			Policy: func() neurogate.DispatchPolicy {
 				p := neurogate.DefaultDispatchPolicy()
 				p.MinLogSumExp = 6.0
+				p.MinUniqueTokenRatio = 0.40 // v2.5.0 voice command loop cutoff
 				return p
 			}(),
 			MinCosine:   0.30,
@@ -609,6 +634,7 @@ func getDomainSuites() map[string]DomainSuite {
 				{Query: "unlock front door deadbolt for delivery courier guest", Expectation: "DoorLock"},
 				{Query: "play smooth jazz music on living room soundbar speaker", Expectation: "MediaPlayback"},
 				{Query: "pause spotify audio playback on bedroom speaker", Expectation: "MediaPlayback"},
+				{Query: "dark dark dark dark dark dark", Expectation: "Fail-Safe: Layer 1 Repetitive Acoustic Loop (Safe Lockout)"},
 				{Query: "qwertyuiopasdfghjklzxcvbnm", Expectation: "Fail-Safe: Layer 1 Voice Glitch / Unlearned Gibberish (Safe Lockout)"},
 				{Query: "order pizza with pineapple from nearby grocery store", Expectation: "Fail-Safe: Layer 2 OOD Command (Hardware Safe Lockout)"},
 				{Query: "light cooling door soundbar switch everything", Expectation: "Fail-Safe: Layer 2 Ambiguity (Voice Clarification Required)"},
